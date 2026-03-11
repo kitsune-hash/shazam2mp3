@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 Shazam to MP3 downloader.
-Reads Shazam links, extracts artist/title, downloads via spotdl (Spotify + YouTube).
+Reads Shazam links, extracts artist/title, downloads from YouTube via yt-dlp.
 
 Usage:
   python shazam2mp3.py links.txt -o ./music
   python shazam2mp3.py links.txt -o ./music --format flac
   echo "https://www.shazam.com/track/123" | python shazam2mp3.py - -o ./music
 
-Requires: pip install spotdl yt-dlp requests beautifulsoup4
+Requires: pip install yt-dlp requests
+Also needs ffmpeg installed for audio conversion.
 """
 
 import argparse
@@ -56,7 +57,7 @@ def extract_track_info(url):
     # Fallback: og:title (format: "Title - Artist: ...")
     og_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
     if og_match:
-        raw = og_match.group(1).split(":")[0].strip()  # Remove ": Song Lyrics..."
+        raw = og_match.group(1).split(":")[0].strip()
         if " - " in raw:
             title, artist = raw.split(" - ", 1)
             return {"artist": artist.strip(), "title": title.strip(), "url": url}
@@ -66,27 +67,34 @@ def extract_track_info(url):
 
 
 def download_track(artist, title, output_dir, audio_format="mp3"):
-    """Download a track using spotdl."""
+    """Download a track from YouTube using yt-dlp."""
     query = f"{artist} - {title}"
+    output_template = str(Path(output_dir) / f"{artist} - {title}.%(ext)s")
+
     cmd = [
-        "spotdl", "download", query,
-        "--output", str(output_dir),
-        "--format", audio_format,
+        "yt-dlp",
+        "--default-search", "ytsearch",
+        "-x",
+        "--audio-format", audio_format,
+        "--audio-quality", "0",
+        "-o", output_template,
+        "--no-playlist",
+        "--quiet",
+        "--no-warnings",
+        f"ytsearch:{query}",
     ]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             return True
-        if "Downloaded" in result.stdout or "Skipping" in result.stdout:
-            return True
-        print(f"  ✗ spotdl error: {result.stderr.strip()}", file=sys.stderr)
+        print(f"  ✗ yt-dlp error: {result.stderr.strip()}", file=sys.stderr)
         return False
     except subprocess.TimeoutExpired:
         print(f"  ✗ Download timed out for: {query}", file=sys.stderr)
         return False
     except FileNotFoundError:
-        print("Error: spotdl not found. Install with: pip install spotdl", file=sys.stderr)
+        print("Error: yt-dlp not found. Install with: pip install yt-dlp", file=sys.stderr)
         sys.exit(1)
 
 
@@ -171,8 +179,9 @@ def main():
             print(f"    ✗ Failed")
 
     # Summary
+    downloaded = len(tracks) - len(failed_download)
     print(f"\n{'='*50}")
-    print(f"Done! {len(tracks) - len(failed_download)}/{len(links)} tracks downloaded to {output_dir.resolve()}")
+    print(f"Done! {downloaded}/{len(links)} tracks downloaded to {output_dir.resolve()}")
     if failed_extract:
         print(f"\nFailed to extract ({len(failed_extract)}):")
         for link in failed_extract:

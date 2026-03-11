@@ -1,13 +1,13 @@
 # shazam2mp3
 
-Download MP3s from Shazam links. Extracts artist/title from Shazam pages and downloads via [spotdl](https://github.com/spotDL/spotify-downloader) (Spotify matching + YouTube audio).
+Download MP3s from Shazam links. Extracts artist/title from Shazam pages and downloads audio from YouTube via [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
 Perfect for converting a list of Shazam discoveries into a USB-ready music collection.
 
 ## Install
 
 ```bash
-pip install spotdl yt-dlp requests beautifulsoup4
+pip install yt-dlp requests
 ```
 
 You'll also need [ffmpeg](https://ffmpeg.org/download.html) installed.
@@ -16,9 +16,10 @@ You'll also need [ffmpeg](https://ffmpeg.org/download.html) installed.
 
 ```bash
 # Create a text file with Shazam links (one per line)
+# Can be copy-pasted directly from chat messages — extra text is ignored
 cat > links.txt << EOL
 https://www.shazam.com/track/58153086
-https://www.shazam.com/track/123456789
+https://www.shazam.com/track/52615880?referrer=share
 EOL
 
 # Download all as MP3
@@ -46,8 +47,8 @@ cat links.txt | python shazam2mp3.py - -o ./music
 ## How it works
 
 1. Fetches each Shazam page and extracts artist/title from JSON-LD metadata
-2. Uses `spotdl` to find the track on Spotify and download the audio from YouTube
-3. Tags the MP3 with proper metadata (artist, title, album, artwork)
+2. Searches YouTube for the best match via yt-dlp
+3. Downloads and converts to the desired audio format
 
 ## License
 
