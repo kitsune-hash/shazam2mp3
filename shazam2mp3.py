@@ -127,8 +127,59 @@ async def identify_audio(audio_path):
     return None
 
 
-def process_facebook_link(url, index):
-    """Process a Facebook/Instagram video link: download, identify, return track info."""
+def extract_facebook_metadata(url):
+    """Try to extract track info from Facebook video metadata via yt-dlp."""
+    cmd = ["yt-dlp", "--dump-json", "--no-download", "--quiet", "--no-warnings", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        data = json.loads(result.stdout)
+
+        # Check for explicit track/artist metadata (Facebook music tags)
+        track = data.get("track")
+        artist = data.get("artist") or data.get("creator") or data.get("uploader")
+        if track and artist:
+            return {"artist": artist, "title": track}
+
+        # Check title for "Artist - Title" or "Title by Artist" patterns
+        title = data.get("title", "")
+        description = data.get("description", "")
+
+        # Try common patterns in title/description
+        for text in [title, description]:
+            if not text:
+                continue
+            # "Artist - Title" pattern
+            m = re.match(r"^(.+?)\s*[-–]\s*(.+)$", text.strip())
+            if m and len(m.group(1)) < 60 and len(m.group(2)) < 80:
+                return {"artist": m.group(1).strip(), "title": m.group(2).strip()}
+
+        # If we have a meaningful title (not just "Facebook" or generic), return it
+        if title and len(title) > 3 and title.lower() not in ("facebook", "reel", "video"):
+            return {"artist": data.get("uploader", "Unknown"), "title": title, "partial": True}
+
+        return None
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        return None
+
+
+def process_facebook_link(url, index, cookies_file=None):
+    """Process a Facebook/Instagram video link: extract metadata, identify, return track info."""
+
+    # Step 1: Try to get metadata without downloading
+    print(f"    Checking video metadata...")
+    meta = extract_facebook_metadata(url)
+    if meta and not meta.get("partial"):
+        print(f"    → Found in metadata: {meta['artist']} - {meta['title']}")
+        return {
+            "artist": meta["artist"], "title": meta["title"],
+            "url": url, "source": "facebook-metadata",
+        }
+    if meta and meta.get("partial"):
+        print(f"    ℹ Partial metadata: {meta.get('title', '?')} (will verify via fingerprint)")
+
+    # Step 2: Download audio and fingerprint via Shazam
     with tempfile.TemporaryDirectory(prefix="shazam2mp3_") as tmp_dir:
         print(f"    Downloading video...")
         audio_path = download_video_audio(url, tmp_dir)
@@ -144,6 +195,13 @@ def process_facebook_link(url, index):
             return {
                 "artist": info["artist"], "title": info["title"],
                 "url": url, "source": "facebook-identified",
+            }
+        elif meta and meta.get("partial"):
+            # Use partial metadata as fallback
+            print(f"    ⚠ Shazam failed, using partial metadata")
+            return {
+                "artist": meta["artist"], "title": meta["title"],
+                "url": url, "source": "facebook-partial",
             }
         else:
             print(f"    ⚠ Could not identify song, will keep extracted audio")
@@ -222,6 +280,8 @@ def main():
                         help="Audio format (default: mp3)")
     parser.add_argument("--dry-run", action="store_true", help="Extract/identify track info only, don't download")
     parser.add_argument("--delay", type=float, default=1.0, help="Delay between requests (default: 1s)")
+    parser.add_argument("--cookies", default=None,
+                        help="Path to cookies.txt file (needed for Facebook login-walled content)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
