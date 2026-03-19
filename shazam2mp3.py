@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Shazam/Facebook to MP3 downloader.
-Reads Shazam links and Facebook video links, extracts or identifies artist/title,
-downloads from YouTube via yt-dlp.
+Shazam/Facebook/YouTube to MP3 downloader.
+Reads Shazam links, Facebook/Instagram video links, and YouTube links.
+Extracts or identifies artist/title, downloads from YouTube via yt-dlp.
 
 Supports:
-  - Shazam links: extracts artist/title from page metadata
+  - Shazam links: extracts artist/title from page metadata or chat context
   - Facebook links (reels, videos): downloads video, identifies song via Shazam
     audio fingerprinting, then downloads proper MP3
+  - YouTube links: downloads audio directly
+  - Chat file parsing: reads WhatsApp/Telegram chat exports, extracts links
+    and uses surrounding text for metadata (e.g. "Title par Artist <shazam-url>")
 
 Usage:
   python shazam2mp3.py links.txt -o ./music
+  python shazam2mp3.py --chat-file conversation.txt -o ./music
   python shazam2mp3.py links.txt -o ./music --format flac
   echo "https://www.shazam.com/track/123" | python shazam2mp3.py - -o ./music
 
@@ -32,12 +36,79 @@ import requests
 
 
 def classify_link(url):
-    """Classify a URL as 'shazam', 'facebook', or 'unknown'."""
+    """Classify a URL as 'shazam', 'facebook', 'youtube', or 'unknown'."""
     if "shazam.com" in url:
         return "shazam"
     if any(d in url for d in ("facebook.com", "fb.watch", "fb.com", "instagram.com")):
         return "facebook"
+    if any(d in url for d in ("youtube.com", "youtu.be")):
+        return "youtube"
     return "unknown"
+
+
+def sanitize_filename(name):
+    """Remove characters that are invalid in filenames."""
+    return re.sub(r'[<>:"/\\|?*]', '', name).strip()
+
+
+def parse_chat_file(filepath):
+    """Parse a WhatsApp/Telegram chat export and extract links with context metadata.
+    
+    Recognizes patterns like:
+      - "Title par Artist https://www.shazam.com/track/..."  (metadata before link)
+      - "[timestamp] Name: Title par Artist https://..."      (WhatsApp format)
+      - "[timestamp] Name: https://..."                       (link only)
+    
+    Returns deduplicated list of {url, type, artist?, title?}
+    """
+    text = Path(filepath).read_text(encoding='utf-8')
+    lines = text.splitlines()
+    
+    entries = []
+    seen_urls = set()
+    
+    # Pattern: "Title par Artist URL" or just "URL"
+    # The "par" pattern is French Shazam sharing format
+    shazam_with_meta = re.compile(
+        r'(.+?)\s+par\s+(.+?)\s+(https?://(?:www\.)?shazam\.com/\S+)'
+    )
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Strip WhatsApp/Telegram timestamp prefix: [HH:MM, DD/MM/YYYY] Name: 
+        cleaned = re.sub(r'^\[[\d:,/ ]+\]\s*[^:]+:\s*', '', line)
+        
+        # Try "Title par Artist <shazam-url>" pattern
+        m = shazam_with_meta.search(cleaned)
+        if m:
+            title = m.group(1).strip()
+            artist = m.group(2).strip()
+            url = m.group(3).strip()
+            
+            if url not in seen_urls:
+                seen_urls.add(url)
+                entries.append({
+                    "url": url, "type": "shazam",
+                    "artist": artist, "title": title,
+                    "source": "chat-metadata"
+                })
+            continue
+        
+        # Extract all URLs from the line
+        urls = re.findall(r'https?://\S+', cleaned)
+        for url in urls:
+            if url in seen_urls:
+                continue
+            
+            link_type = classify_link(url)
+            if link_type != "unknown":
+                seen_urls.add(url)
+                entries.append({"url": url, "type": link_type})
+    
+    return entries
 
 
 def extract_track_info(url):
@@ -211,6 +282,33 @@ def process_facebook_link(url, index, cookies_file=None):
             }
 
 
+def download_youtube(url, output_dir, audio_format="mp3"):
+    """Download audio from a YouTube link."""
+    # First get the title
+    cmd = ["yt-dlp", "--dump-json", "--no-download", "--quiet", "--no-warnings", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout)
+            title = data.get("title", "unknown")
+        else:
+            title = "unknown"
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        title = "unknown"
+
+    filename = sanitize_filename(title)
+    output_template = str(Path(output_dir) / f"{filename}.%(ext)s")
+    cmd = [
+        "yt-dlp", "-x", "--audio-format", audio_format, "--audio-quality", "0",
+        "-o", output_template, "--no-playlist", "--quiet", "--no-warnings", url,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return result.returncode == 0, title
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False, title
+
+
 def download_facebook_audio_direct(url, output_dir, filename, audio_format="mp3"):
     """Download audio directly from a Facebook video (for unidentified tracks)."""
     output_template = str(Path(output_dir) / f"{filename}.%(ext)s")
@@ -228,7 +326,8 @@ def download_facebook_audio_direct(url, output_dir, filename, audio_format="mp3"
 def download_track(artist, title, output_dir, audio_format="mp3"):
     """Download a track from YouTube using yt-dlp."""
     query = f"{artist} - {title}"
-    output_template = str(Path(output_dir) / f"{artist} - {title}.%(ext)s")
+    filename = sanitize_filename(f"{artist} - {title}")
+    output_template = str(Path(output_dir) / f"{filename}.%(ext)s")
     cmd = [
         "yt-dlp", "--default-search", "ytsearch", "-x",
         "--audio-format", audio_format, "--audio-quality", "0",
@@ -250,7 +349,7 @@ def download_track(artist, title, output_dir, audio_format="mp3"):
 
 
 def read_links(source):
-    """Read links from file or stdin. Supports Shazam, Facebook, and Instagram URLs."""
+    """Read links from file or stdin. Supports Shazam, Facebook, Instagram, and YouTube URLs."""
     if source == "-":
         lines = sys.stdin.read().splitlines()
     else:
@@ -273,8 +372,11 @@ def read_links(source):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download MP3s from Shazam & Facebook links")
-    parser.add_argument("input", help="Text file with links (one per line), or - for stdin")
+    parser = argparse.ArgumentParser(description="Download MP3s from Shazam, Facebook & YouTube links")
+    parser.add_argument("input", nargs='?', default=None,
+                        help="Text file with links (one per line), or - for stdin")
+    parser.add_argument("--chat-file", default=None,
+                        help="WhatsApp/Telegram chat export file (parses links + metadata)")
     parser.add_argument("-o", "--output", default="./music", help="Output directory (default: ./music)")
     parser.add_argument("-f", "--format", default="mp3", choices=["mp3", "flac", "ogg", "m4a"],
                         help="Audio format (default: mp3)")
@@ -284,69 +386,101 @@ def main():
                         help="Path to cookies.txt file (needed for Facebook login-walled content)")
     args = parser.parse_args()
 
+    if not args.input and not args.chat_file:
+        parser.error("Either input file or --chat-file is required")
+
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    links = read_links(args.input)
-    if not links:
+    # Parse input
+    if args.chat_file:
+        entries = parse_chat_file(args.chat_file)
+    else:
+        entries = read_links(args.input)
+
+    if not entries:
         print("No supported links found in input.", file=sys.stderr)
         sys.exit(1)
 
-    shazam_count = sum(1 for l in links if l["type"] == "shazam")
-    fb_count = sum(1 for l in links if l["type"] == "facebook")
-    print(f"Found {len(links)} links ({shazam_count} Shazam, {fb_count} Facebook/Instagram)")
+    # Count by type
+    shazam_count = sum(1 for e in entries if e["type"] == "shazam")
+    fb_count = sum(1 for e in entries if e["type"] == "facebook")
+    yt_count = sum(1 for e in entries if e["type"] == "youtube")
+    pre_identified = sum(1 for e in entries if e.get("source") == "chat-metadata")
+    
+    print(f"Found {len(entries)} unique links ({shazam_count} Shazam, {fb_count} Facebook/Instagram, {yt_count} YouTube)")
+    if pre_identified:
+        print(f"  → {pre_identified} Shazam tracks already identified from chat metadata (skipping web fetch)")
     print(f"Output: {output_dir.resolve()}")
     print(f"Format: {args.format}")
     print()
 
     tracks = []
+    youtube_tracks = []
     failed_extract = []
     unidentified = []
     unknown_counter = 0
 
     print("Extracting track info...")
-    for i, link in enumerate(links, 1):
-        url = link["url"]
-        link_type = link["type"]
-        print(f"  [{i}/{len(links)}] ({link_type}) {url}")
+    for i, entry in enumerate(entries, 1):
+        url = entry["url"]
+        link_type = entry["type"]
+        print(f"  [{i}/{len(entries)}] ({link_type}) {url}")
 
         if link_type == "shazam":
-            info = extract_track_info(url)
-            if info:
-                print(f"    → {info['artist']} - {info['title']}")
-                tracks.append(info)
+            # Check if we already have metadata from chat parsing
+            if entry.get("source") == "chat-metadata":
+                print(f"    → From chat: {entry['artist']} - {entry['title']}")
+                tracks.append(entry)
             else:
-                failed_extract.append(url)
+                info = extract_track_info(url)
+                if info:
+                    print(f"    → {info['artist']} - {info['title']}")
+                    tracks.append(info)
+                else:
+                    failed_extract.append(url)
+
         elif link_type == "facebook":
             unknown_counter += 1
             info = process_facebook_link(url, unknown_counter)
             if info:
-                if info["source"] == "facebook-identified":
+                if info["source"] in ("facebook-identified", "facebook-metadata"):
                     tracks.append(info)
                 else:
                     unidentified.append(info)
             else:
                 failed_extract.append(url)
 
-        if i < len(links):
+        elif link_type == "youtube":
+            youtube_tracks.append({"url": url, "type": "youtube"})
+            print(f"    → YouTube link (will download directly)")
+
+        if i < len(entries):
             time.sleep(args.delay)
 
     identified = len(tracks)
-    print(f"\nIdentified {identified}/{len(links)} tracks")
+    print(f"\nIdentified {identified}/{len(entries)} tracks")
+    if youtube_tracks:
+        print(f"YouTube direct downloads: {len(youtube_tracks)}")
     if unidentified:
         print(f"Unidentified (will save raw audio): {len(unidentified)}")
 
     if args.dry_run:
         print("\nDry run — tracks found:")
         for t in tracks:
-            print(f"  [{t['source']}] {t['artist']} - {t['title']}")
+            src = t.get('source', '?')
+            print(f"  [{src}] {t['artist']} - {t['title']}")
+        if youtube_tracks:
+            print(f"\nYouTube ({len(youtube_tracks)}):")
+            for yt in youtube_tracks:
+                print(f"  {yt['url']}")
         if unidentified:
             print(f"\nUnidentified ({len(unidentified)}):")
             for u in unidentified:
                 print(f"  {u['url']}")
         return
 
-    # Download identified tracks from YouTube
+    # Download identified tracks from YouTube search
     failed_download = []
     if tracks:
         print("\nDownloading identified tracks...\n")
@@ -358,6 +492,18 @@ def main():
                 print(f"    ✓ Downloaded")
             else:
                 failed_download.append(query)
+                print(f"    ✗ Failed")
+
+    # Download YouTube links directly
+    if youtube_tracks:
+        print("\nDownloading YouTube tracks...\n")
+        for i, yt in enumerate(youtube_tracks, 1):
+            print(f"  [{i}/{len(youtube_tracks)}] {yt['url']}")
+            ok, title = download_youtube(yt["url"], output_dir, args.format)
+            if ok:
+                print(f"    ✓ Downloaded: {title}")
+            else:
+                failed_download.append(yt["url"])
                 print(f"    ✗ Failed")
 
     # Save raw audio for unidentified tracks
@@ -374,11 +520,15 @@ def main():
                 print(f"    ✗ Failed")
 
     # Summary
-    total_success = len(tracks) + len(unidentified) - len(failed_download)
+    total_items = len(tracks) + len(youtube_tracks) + len(unidentified)
+    total_success = total_items - len(failed_download)
     print(f"\n{'='*50}")
-    print(f"Done! {total_success}/{len(links)} tracks downloaded to {output_dir.resolve()}")
+    print(f"Done! {total_success}/{len(entries)} tracks downloaded to {output_dir.resolve()}")
     if identified:
-        print(f"  ✓ {identified} identified via Shazam metadata or audio fingerprint")
+        print(f"  ✓ {identified} identified via metadata/fingerprint")
+    if youtube_tracks:
+        yt_ok = len(youtube_tracks) - sum(1 for f in failed_download if f.startswith("http"))
+        print(f"  ✓ {yt_ok} downloaded from YouTube")
     if unidentified:
         saved = len(unidentified) - sum(1 for f in failed_download if f.startswith("unknown_"))
         print(f"  ⚠ {saved} saved as raw audio (could not identify)")
